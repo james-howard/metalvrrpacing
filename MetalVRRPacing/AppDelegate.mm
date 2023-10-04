@@ -12,6 +12,7 @@
 #import <imgui_impl_osx.h>
 #import <imgui_impl_metal.h>
 
+#import <mutex>
 #import <chrono>
 #import <thread>
 
@@ -32,6 +33,7 @@ static void SleepUntil(std::chrono::steady_clock::time_point hostTime) {
     NSUInteger _lastPresentFrameCount;
     double _presentHistory;
     NSUInteger _frameCount;
+    std::mutex _historyMutex;
 }
 
 @property (strong) IBOutlet NSWindow *window;
@@ -131,6 +133,8 @@ static void SleepUntil(std::chrono::steady_clock::time_point hostTime) {
 #pragma mark - Present History Calculation
 
 - (void)addPresentTime:(double)hostTime forFrame:(NSUInteger)frameNumber {
+    std::lock_guard lock(_historyMutex);
+
     double dt = _lastPresent > 0.0 ? hostTime - _lastPresent : 0.0;
     _lastPresent = hostTime;
     _lastPresentFrameCount = frameNumber;
@@ -235,10 +239,10 @@ static void SleepUntil(std::chrono::steady_clock::time_point hostTime) {
     NSScreen *screen = view.window.screen;
     [drawable addPresentedHandler:^(id<MTLDrawable> drawn) {
         double time = drawn.presentedTime ?: screen.lastDisplayUpdateTimestamp ?: CACurrentMediaTime();
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self addPresentTime:time forFrame:frameCount];
-        });
+        [self addPresentTime:time forFrame:frameCount];
     }];
+
+    std::unique_lock historyLock(_historyMutex);
 
     MTLRenderPassDescriptor *desc = view.currentRenderPassDescriptor;
     desc.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, sin(CACurrentMediaTime()) * 0.5 + 0.5, 1);
@@ -264,6 +268,8 @@ static void SleepUntil(std::chrono::steady_clock::time_point hostTime) {
         // Therefore the time needs to be projected forward by that number of frames.
         presentTime = _lastPresent + (frameTime * (frameCount - _lastPresentFrameCount));
     }
+
+    historyLock.unlock();
 
     [buf presentDrawable:drawable atTime:presentTime];
 
