@@ -12,8 +12,26 @@
 #import <imgui_impl_osx.h>
 #import <imgui_impl_metal.h>
 
+#import <chrono>
+#import <thread>
+
+static void SleepUntil(std::chrono::steady_clock::time_point hostTime) {
+    thread_local std::chrono::steady_clock::duration overslept;
+    hostTime -= overslept;
+    auto start = std::chrono::steady_clock::now();
+    const auto accuracy = std::chrono::milliseconds(8);
+    if (hostTime - start > accuracy)
+        std::this_thread::sleep_for(hostTime - start - (accuracy / 2));
+    while (std::chrono::steady_clock::now() < hostTime)
+        std::this_thread::yield();
+    overslept = std::chrono::steady_clock::now() - hostTime;
+}
+
 @interface AppDelegate () <NSWindowDelegate, MTKViewDelegate> {
-    NSTimeInterval _displayRefreshHistory[10];
+    double _lastPresent;
+    NSUInteger _lastPresentFrameCount;
+    double _presentHistory;
+    NSUInteger _frameCount;
 }
 
 @property (strong) IBOutlet NSWindow *window;
@@ -22,6 +40,10 @@
 @property (strong) NSTimer *timer;
 @property NSTimeInterval lastImGuiTime;
 @property int requestedDisplayRate;
+
+@property NSTimeInterval screenMinRefresh;
+@property NSTimeInterval screenMaxRefresh;
+@property NSTimeInterval screenGranularity;
 
 @end
 
@@ -36,17 +58,34 @@
     // initialize GUI state
     self.requestedDisplayRate = 60;
 
-    // create metal view
-    [self setupView];
+    // find the best display (fastest and has VRR)
+    NSScreen *screen = [[[NSScreen screens] sortedArrayUsingComparator:^NSComparisonResult(NSScreen *a, NSScreen *b) {
+        BOOL aVRR = a.minimumRefreshInterval != a.maximumRefreshInterval;
+        BOOL bVRR = b.minimumRefreshInterval != b.maximumRefreshInterval;
+        if (aVRR && !bVRR) {
+            return NSOrderedAscending;
+        } else if (!aVRR && bVRR) {
+            return NSOrderedDescending;
+        } else if (a.maximumRefreshInterval < b.maximumRefreshInterval) {
+            return NSOrderedAscending;
+        } else if (a.maximumRefreshInterval > b.maximumRefreshInterval) {
+            return NSOrderedDescending;
+        } else {
+            return NSOrderedSame;
+        }
+    }] firstObject];
 
-    // go fullscreen
-    NSScreen *screen = [NSScreen mainScreen];
     NSRect frame = [screen frame];
-    NSLog(@"Frame is %@", NSStringFromRect(frame));
+    NSLog(@"Display is %@ Frame is %@", [screen localizedName], NSStringFromRect(frame));
     self.window.delegate = self;
     self.window.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
     self.window.backgroundColor = [NSColor redColor];
     [self.window setFrame:frame display:YES];
+
+    // create metal view
+    [self setupView];
+
+    // go fullscreen
     [self.window toggleFullScreen:nil];
 }
 
@@ -62,6 +101,10 @@
     self.window.contentView = self.view;
     [self.view setPaused:YES]; // we don't want a display link, we're trying to draw on our own time
 
+    self.screenMinRefresh = self.window.screen.minimumRefreshInterval;
+    self.screenMaxRefresh = self.window.screen.maximumRefreshInterval;
+    self.screenGranularity = self.window.screen.displayUpdateGranularity;
+
     NSLog(@"Display %@ min refresh %.3fms max refresh %.3fms granularity %.3fms",
           self.window.screen.localizedName,
           self.window.screen.minimumRefreshInterval * 1000.0,
@@ -69,6 +112,7 @@
           self.window.screen.displayUpdateGranularity * 1000.0);
 
 //    CAMetalLayer *mtlLayer = (id)self.view.layer;
+//    mtlLayer.maximumDrawableCount = 2;
 //    mtlLayer.displaySyncEnabled = NO;
 
     self.cmdQ = [self.view.device newCommandQueue];
@@ -84,28 +128,22 @@
     self.timer = [NSTimer scheduledTimerWithTimeInterval:0 target:self.view selector:@selector(draw) userInfo:nil repeats:YES];
 }
 
-#pragma mark - Display Refresh History Calculation
+#pragma mark - Present History Calculation
 
-- (void)updateDisplayRefreshHistory {
-    NSScreen *screen = self.view.window.screen;
-    NSTimeInterval lastUpdate = screen.lastDisplayUpdateTimestamp;
-    // scoot old values down
-    size_t len = sizeof(_displayRefreshHistory) / sizeof(_displayRefreshHistory[0]);
-    for (size_t i = len; i > 1; --i)
-        _displayRefreshHistory[i-1] = _displayRefreshHistory[i-2];
-    // store latest value
-    _displayRefreshHistory[0] = lastUpdate;
+- (void)addPresentTime:(double)hostTime forFrame:(NSUInteger)frameNumber {
+    double dt = _lastPresent > 0.0 ? hostTime - _lastPresent : 0.0;
+    _lastPresent = hostTime;
+    _lastPresentFrameCount = frameNumber;
+
+    double historySize = 30.0;
+    double alpha = 2.0 / (historySize + 1.0);
+
+    _presentHistory = (alpha * dt) + ((1.0 - alpha) * _presentHistory);
 }
 
-- (NSTimeInterval)displayRefreshHistory {
-    NSTimeInterval sum = 0.0;
-    size_t len = sizeof(_displayRefreshHistory) / sizeof(_displayRefreshHistory[0]);
-    for (size_t i = 0; i < len-1; ++i) {
-        sum += _displayRefreshHistory[i] - _displayRefreshHistory[i+1];
-    }
-    return sum / (len-1);
+- (double)averagePresentInterval {
+    return _presentHistory;
 }
-
 
 #pragma mark - ImGui
 
@@ -170,15 +208,15 @@
     
     ImGui::Begin("MetalVRRPacing", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize);
     ImGui::Text("Display: %s", [screen.localizedName UTF8String]);
-    ImGui::Text("Min Refresh: %.0fHz", 1.0 / screen.maximumRefreshInterval);
-    ImGui::Text("Max Refresh: %.0fHz", 1.0 / screen.minimumRefreshInterval);
-    ImGui::Text("Update Granularity: %.0fms", screen.displayUpdateGranularity);
+    ImGui::Text("Min Refresh: %.0fHz", 1.0 / self.screenMaxRefresh);
+    ImGui::Text("Max Refresh: %.0fHz", 1.0 / self.screenMinRefresh);
+    ImGui::Text("Update Granularity: %.0fms", self.screenGranularity * 1000.0);
     ImGui::Separator();
-    ImGui::Text("Current Refresh: %.0fHz", 1.0 / [self displayRefreshHistory]);
-    
+    ImGui::Text("Current Refresh: %.0fHz", 1.0 / [self averagePresentInterval]);
+
     ImGui::Separator();
-    int rateMin = 1.0 / screen.maximumRefreshInterval;
-    int rateMax = 1.0 / screen.minimumRefreshInterval;
+    int rateMin = 1.0 / self.screenMaxRefresh;
+    int rateMax = 1.0 / self.screenMinRefresh;
     ImGui::SliderInt("Desired Refresh", &_requestedDisplayRate, rateMin, rateMax+1);
     
     ImGui::End();
@@ -191,14 +229,20 @@
     id<MTLCommandBuffer> buf = [self.cmdQ commandBuffer];
 
     id<CAMetalDrawable> drawable = view.currentDrawable;
-    [drawable addPresentedHandler:^(id<MTLDrawable> drawable) {
+    NSUInteger frameCount = _frameCount;
+    ++_frameCount;
+    NSScreen *screen = view.window.screen;
+    [drawable addPresentedHandler:^(id<MTLDrawable> drawn) {
+        double time = drawn.presentedTime ?: screen.lastDisplayUpdateTimestamp ?: CACurrentMediaTime();
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self updateDisplayRefreshHistory];
+            [self addPresentTime:time forFrame:frameCount];
         });
     }];
 
     MTLRenderPassDescriptor *desc = view.currentRenderPassDescriptor;
     desc.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, sin(CACurrentMediaTime()) * 0.5 + 0.5, 1);
+    if ([NSEvent pressedMouseButtons] & 1)
+        desc.colorAttachments[0].clearColor = MTLClearColorMake(0, 1, 0, 1);
     desc.colorAttachments[0].loadAction = MTLLoadActionClear;
 
     id<MTLRenderCommandEncoder> cmdEnc = [buf renderCommandEncoderWithDescriptor:desc];
@@ -211,7 +255,17 @@
 
     // set FPS
     NSTimeInterval frameTime = 1.0 / _requestedDisplayRate;
-    [buf presentDrawable:drawable afterMinimumDuration:frameTime];
+
+    double presentTime = CACurrentMediaTime() + frameTime;
+
+    if (_lastPresentFrameCount) {
+        // _lastPresent will be a time for some frame in the past, probably a few frames behind the current.
+        // Therefore the time needs to be projected forward by that number of frames.
+        presentTime = _lastPresent + (frameTime * (frameCount - _lastPresentFrameCount));
+    }
+
+    [buf presentDrawable:drawable atTime:presentTime];
+
     [buf commit];
 }
 
