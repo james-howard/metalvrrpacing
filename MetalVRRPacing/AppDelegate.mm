@@ -213,6 +213,7 @@ static void SleepUntil(std::chrono::steady_clock::time_point hostTime) {
     ImGui::Text("Update Granularity: %.0fms", self.screenGranularity * 1000.0);
     ImGui::Separator();
     ImGui::Text("Current Refresh: %.0fHz", 1.0 / [self averagePresentInterval]);
+    ImGui::Text("Present Time Frame Lag: %d", static_cast<int>(_frameCount - _lastPresentFrameCount - 1));
 
     ImGui::Separator();
     int rateMin = 1.0 / self.screenMaxRefresh;
