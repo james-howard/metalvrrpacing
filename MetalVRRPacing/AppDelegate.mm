@@ -31,6 +31,7 @@ static void SleepUntil(double hostTime) {
 enum PacingType : int {
     PacingTypePresentAtTime = 0,
     PacingTypeSleep,
+    PacingTypeNone,
     PacingTypeMax
 };
 
@@ -40,6 +41,8 @@ static const char *PacingTypeToString(PacingType type) {
             return "presentDrawable:atTime:";
         case PacingTypeSleep:
             return "Accurate Sleep";
+        case PacingTypeNone:
+            return "None";
         case PacingTypeMax:
             assert(0);
             return "";
@@ -318,6 +321,8 @@ static const char *PacingTypeToString(PacingType type) {
             break;
         case PacingTypeSleep:
             SleepUntil(_lastPresentDrawable + frameTime);
+            // intentional fallthrough
+        case PacingTypeNone:
             [buf presentDrawable:drawable];
             break;
         default:
