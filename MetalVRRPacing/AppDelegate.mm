@@ -16,23 +16,44 @@
 #import <chrono>
 #import <thread>
 
-static void SleepUntil(std::chrono::steady_clock::time_point hostTime) {
-    thread_local std::chrono::steady_clock::duration overslept;
+static void SleepUntil(double hostTime) {
+    thread_local double overslept;
     hostTime -= overslept;
-    auto start = std::chrono::steady_clock::now();
-    const auto accuracy = std::chrono::milliseconds(8);
+    auto start = CACurrentMediaTime();
+    const auto accuracy = 0.008; // 8 millis
     if (hostTime - start > accuracy)
-        std::this_thread::sleep_for(hostTime - start - (accuracy / 2));
-    while (std::chrono::steady_clock::now() < hostTime)
+        usleep(USEC_PER_SEC * (hostTime - start - (accuracy / 2.0)));
+    while (CACurrentMediaTime() < hostTime)
         std::this_thread::yield();
-    overslept = std::chrono::steady_clock::now() - hostTime;
+    overslept = CACurrentMediaTime() - hostTime;
+}
+
+enum PacingType : int {
+    PacingTypePresentAtTime = 0,
+    PacingTypeSleep,
+    PacingTypeMax
+};
+
+static const char *PacingTypeToString(PacingType type) {
+    switch (type) {
+        case PacingTypePresentAtTime:
+            return "presentDrawable:atTime:";
+        case PacingTypeSleep:
+            return "Accurate Sleep";
+        case PacingTypeMax:
+            assert(0);
+            return "";
+    }
 }
 
 @interface AppDelegate () <NSWindowDelegate, MTKViewDelegate> {
-    double _lastPresent;
+    double _lastPresent; // time when display last updated
     NSUInteger _lastPresentFrameCount;
     double _presentHistory;
+    double _lastPresentDrawable; // time when presentDrawable: message sent
     NSUInteger _frameCount;
+    PacingType _pacingType;
+    BOOL _vsync;
     std::mutex _historyMutex;
 }
 
@@ -59,6 +80,7 @@ static void SleepUntil(std::chrono::steady_clock::time_point hostTime) {
     
     // initialize GUI state
     self.requestedDisplayRate = 60;
+    _vsync = YES;
 
     // find the best display (fastest and has VRR)
     NSScreen *screen = [[[NSScreen screens] sortedArrayUsingComparator:^NSComparisonResult(NSScreen *a, NSScreen *b) {
@@ -219,21 +241,40 @@ static void SleepUntil(std::chrono::steady_clock::time_point hostTime) {
     ImGui::Text("Current Refresh: %.0fHz", 1.0 / [self averagePresentInterval]);
     ImGui::Text("Present Time Frame Lag: %d", static_cast<int>(_frameCount - _lastPresentFrameCount - 1));
 
+    // --- ---
     ImGui::Separator();
+
+    if (ImGui::BeginCombo("Pacing Type", PacingTypeToString(_pacingType))) {
+        for (int i = 0; i < PacingTypeMax; ++i) {
+            PacingType t = static_cast<PacingType>(i);
+            bool selected = _pacingType == t;
+            if (ImGui::Selectable(PacingTypeToString(t), &selected)) {
+                _pacingType = t;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    ImGui::Checkbox("VSync", &_vsync);
+
     int rateMin = 1.0 / self.screenMaxRefresh;
     int rateMax = 1.0 / self.screenMinRefresh;
     ImGui::SliderInt("Desired Refresh", &_requestedDisplayRate, rateMin, rateMax+1);
-    
+
     ImGui::End();
-    
 }
 
 #pragma mark - MTKViewDelegate
 
 - (void)drawInMTKView:(MTKView *)view {
-    id<MTLCommandBuffer> buf = [self.cmdQ commandBuffer];
+    CAMetalLayer *mtlLayer = (CAMetalLayer *)view.layer;
+    mtlLayer.displaySyncEnabled = _vsync;
 
     id<CAMetalDrawable> drawable = view.currentDrawable;
+    id<MTLCommandBuffer> buf = [self.cmdQ commandBuffer];
     NSUInteger frameCount = _frameCount;
     ++_frameCount;
     NSScreen *screen = view.window.screen;
@@ -263,7 +304,7 @@ static void SleepUntil(std::chrono::steady_clock::time_point hostTime) {
 
     double presentTime = CACurrentMediaTime() + frameTime;
 
-    if (_lastPresentFrameCount) {
+    if (frameCount - _lastPresentFrameCount < 5) {
         // _lastPresent will be a time for some frame in the past, probably a few frames behind the current.
         // Therefore the time needs to be projected forward by that number of frames.
         presentTime = _lastPresent + (frameTime * (frameCount - _lastPresentFrameCount));
@@ -271,7 +312,19 @@ static void SleepUntil(std::chrono::steady_clock::time_point hostTime) {
 
     historyLock.unlock();
 
-    [buf presentDrawable:drawable atTime:presentTime];
+    switch (_pacingType) {
+        case PacingTypePresentAtTime:
+            [buf presentDrawable:drawable atTime:presentTime];
+            break;
+        case PacingTypeSleep:
+            SleepUntil(_lastPresentDrawable + frameTime);
+            [buf presentDrawable:drawable];
+            break;
+        default:
+            assert(0);
+            break;
+    }
+    _lastPresentDrawable = CACurrentMediaTime();
 
     [buf commit];
 }
