@@ -53,13 +53,18 @@ static const char *PacingTypeToString(PacingType type) {
 }
 
 @interface AppDelegate () <NSWindowDelegate, MTKViewDelegate> {
-    double _lastPresent; // time when display last updated
+    double _lastPresentActual; // time when display last updated
+    double _lastPresentExpected;
     NSUInteger _lastPresentFrameCount;
     double _presentHistory;
     double _lastPresentDrawable; // time when presentDrawable: message sent
     NSUInteger _frameCount;
     PacingType _pacingType;
     BOOL _vsync;
+    BOOL _hdr;
+    BOOL _layerHDR;
+    BOOL _wcg;
+    BOOL _layerWCG;
     int _resyncs;
     std::mutex _historyMutex;
 }
@@ -74,6 +79,8 @@ static const char *PacingTypeToString(PacingType type) {
 @property NSTimeInterval screenMinRefresh;
 @property NSTimeInterval screenMaxRefresh;
 @property NSTimeInterval screenGranularity;
+@property BOOL screenHDR;
+@property BOOL screenWCG;
 
 @end
 
@@ -132,9 +139,12 @@ static const char *PacingTypeToString(PacingType type) {
     self.window.contentView = self.view;
     [self.view setPaused:YES]; // we don't want a display link, we're trying to draw on our own time
 
-    self.screenMinRefresh = self.window.screen.minimumRefreshInterval;
-    self.screenMaxRefresh = self.window.screen.maximumRefreshInterval;
-    self.screenGranularity = self.window.screen.displayUpdateGranularity;
+    NSScreen *screen = self.window.screen;
+    self.screenMinRefresh = screen.minimumRefreshInterval;
+    self.screenMaxRefresh = screen.maximumRefreshInterval;
+    self.screenGranularity = screen.displayUpdateGranularity;
+    self.screenHDR = screen.maximumPotentialExtendedDynamicRangeColorComponentValue > 1.0;
+    self.screenWCG = [screen canRepresentDisplayGamut:NSDisplayGamutP3];
 
     NSLog(@"Display %@ min refresh %.3fms max refresh %.3fms granularity %.3fms",
           self.window.screen.localizedName,
@@ -150,7 +160,7 @@ static const char *PacingTypeToString(PacingType type) {
 
     [self setupImGui];
 
-    [self renderLoop];
+//    [self renderLoop];
 }
 
 #pragma mark - RenderLoop
@@ -161,11 +171,12 @@ static const char *PacingTypeToString(PacingType type) {
 
 #pragma mark - Present History Calculation
 
-- (void)addPresentTime:(double)hostTime forFrame:(NSUInteger)frameNumber {
+- (void)addActualPresentTime:(double)actualTime expectedPresentTime:(double)expectedTime forFrame:(NSUInteger)frameNumber {
     std::lock_guard lock(_historyMutex);
 
-    double dt = _lastPresent > 0.0 ? hostTime - _lastPresent : 0.0;
-    _lastPresent = hostTime;
+    double dt = _lastPresentActual > 0.0 ? actualTime - _lastPresentActual : 0.0;
+    _lastPresentActual = actualTime;
+    _lastPresentExpected = expectedTime;
     _lastPresentFrameCount = frameNumber;
 
     double historySize = 30.0;
@@ -244,6 +255,13 @@ static const char *PacingTypeToString(PacingType type) {
     ImGui::Text("Min Refresh: %.0fHz", 1.0 / self.screenMaxRefresh);
     ImGui::Text("Max Refresh: %.0fHz", 1.0 / self.screenMinRefresh);
     ImGui::Text("Update Granularity: %.0fms", self.screenGranularity * 1000.0);
+    if (!_screenHDR) ImGui::BeginDisabled();
+    ImGui::Checkbox("HDR", &_hdr);
+    if (!_screenHDR) ImGui::EndDisabled();
+    if (!_screenWCG) ImGui::BeginDisabled();
+    ImGui::Checkbox("Wide Color", &_wcg);
+    if (!_screenWCG) ImGui::EndDisabled();
+
     ImGui::Separator();
     ImGui::Text("Current Refresh: %.2fHz", 1.0 / [self averagePresentInterval]);
     ImGui::Text("Present Time Frame Lag: %d", static_cast<int>(_frameCount - _lastPresentFrameCount - 1));
@@ -281,11 +299,24 @@ static const char *PacingTypeToString(PacingType type) {
     CAMetalLayer *mtlLayer = (CAMetalLayer *)view.layer;
     mtlLayer.displaySyncEnabled = _vsync;
 
+    if (_layerHDR != _hdr || _layerWCG != _wcg) {
+        _layerHDR = _hdr;
+        _layerWCG = _wcg;
+
+        mtlLayer.pixelFormat = _hdr || _wcg ? MTLPixelFormatBGR10A2Unorm : MTLPixelFormatBGRA8Unorm;
+        mtlLayer.wantsExtendedDynamicRangeContent = _hdr;
+        CGColorSpaceRef cs = NULL;
+        if (_hdr) {
+            cs = CGColorSpaceCreateWithName(kCGColorSpaceDisplayP3_PQ);
+            CFAutorelease(cs);
+        }
+        mtlLayer.colorspace = cs;
+    }
+
     id<CAMetalDrawable> drawable = view.currentDrawable;
     id<MTLCommandBuffer> buf = [self.cmdQ commandBuffer];
     NSUInteger frameCount = _frameCount;
     ++_frameCount;
-    NSScreen *screen = view.window.screen;
 
     std::unique_lock historyLock(_historyMutex);
 
@@ -306,12 +337,12 @@ static const char *PacingTypeToString(PacingType type) {
     // set FPS
     NSTimeInterval frameTime = 1.0 / _requestedDisplayRate;
 
-    double presentTime = CACurrentMediaTime() + frameTime;
+    double presentTime = 0;
 
-    if (frameCount - _lastPresentFrameCount < 5) {
+    if (_lastPresentExpected) {
         // _lastPresent will be a time for some frame in the past, probably a few frames behind the current.
         // Therefore the time needs to be projected forward by that number of frames.
-        presentTime = _lastPresent + (frameTime * (frameCount - _lastPresentFrameCount));
+        presentTime = _lastPresentExpected + (frameTime * (frameCount - _lastPresentFrameCount));
     }
 
     historyLock.unlock();
@@ -324,8 +355,12 @@ static const char *PacingTypeToString(PacingType type) {
             self->_resyncs++;
             time = actualTime;
         }
-        [self addPresentTime:time forFrame:frameCount];
+        [self addActualPresentTime:actualTime expectedPresentTime:time forFrame:frameCount];
     }];
+
+    PacingType pacingType = _pacingType;
+    if (pacingType == PacingTypePresentAtTime && presentTime == 0)
+        pacingType = PacingTypeNone;
 
     switch (_pacingType) {
         case PacingTypePresentAtTime:
@@ -359,6 +394,10 @@ static const char *PacingTypeToString(PacingType type) {
 
 - (void)windowWillExitFullScreen:(NSNotification *)notification {
     [NSApp terminate:nil];
+}
+
+- (void)windowDidEnterFullScreen:(NSNotification *)notification {
+    [self renderLoop];
 }
 
 @end
