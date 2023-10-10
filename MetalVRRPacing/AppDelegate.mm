@@ -60,6 +60,7 @@ static const char *PacingTypeToString(PacingType type) {
     NSUInteger _frameCount;
     PacingType _pacingType;
     BOOL _vsync;
+    int _resyncs;
     std::mutex _historyMutex;
 }
 
@@ -83,7 +84,7 @@ static const char *PacingTypeToString(PacingType type) {
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
     // just turn on the Metal HUD all the time to illustrate the problem.
     setenv("MTL_HUD_ENABLED", "1", 1);
-    
+
     // initialize GUI state
     self.requestedDisplayRate = 60;
     _vsync = YES;
@@ -190,7 +191,7 @@ static const char *PacingTypeToString(PacingType type) {
                                 buffer:(id<MTLCommandBuffer>)cmdBuf
                                encoder:(id<MTLRenderCommandEncoder>)cmdEnc {
     ImGuiIO &io = ImGui::GetIO();
-    
+
     // Give ImGui the time of day
     auto now = CACurrentMediaTime();
     if (self.lastImGuiTime == 0.0)
@@ -198,7 +199,7 @@ static const char *PacingTypeToString(PacingType type) {
     else
         io.DeltaTime = now - self.lastImGuiTime;
     self.lastImGuiTime = now;
-    
+
     // Configure viewport
     io.DisplaySize.x = self.view.bounds.size.width;
     io.DisplaySize.y = self.view.bounds.size.height;
@@ -222,30 +223,31 @@ static const char *PacingTypeToString(PacingType type) {
         io.Fonts->AddFontDefault(&fontConfig);
         io.FontGlobalScale = fontGlobalScale;
     }
-    
+
     ImGui_ImplMetal_NewFrame(renderPassDescriptor);
-    
+
     ImGui::NewFrame();
-    
+
     [self drawImGui];
-    
+
     ImGui::Render();
     ImDrawData *drawData = ImGui::GetDrawData();
-    
+
     ImGui_ImplMetal_RenderDrawData(drawData, cmdBuf, cmdEnc);
 }
 
 - (void)drawImGui {
     NSScreen *screen = self.view.window.screen;
-    
+
     ImGui::Begin("MetalVRRPacing", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize);
     ImGui::Text("Display: %s", [screen.localizedName UTF8String]);
     ImGui::Text("Min Refresh: %.0fHz", 1.0 / self.screenMaxRefresh);
     ImGui::Text("Max Refresh: %.0fHz", 1.0 / self.screenMinRefresh);
     ImGui::Text("Update Granularity: %.0fms", self.screenGranularity * 1000.0);
     ImGui::Separator();
-    ImGui::Text("Current Refresh: %.0fHz", 1.0 / [self averagePresentInterval]);
+    ImGui::Text("Current Refresh: %.2fHz", 1.0 / [self averagePresentInterval]);
     ImGui::Text("Present Time Frame Lag: %d", static_cast<int>(_frameCount - _lastPresentFrameCount - 1));
+    ImGui::Text("Present Time Resyncs: %d", _resyncs);
 
     // --- ---
     ImGui::Separator();
@@ -284,10 +286,6 @@ static const char *PacingTypeToString(PacingType type) {
     NSUInteger frameCount = _frameCount;
     ++_frameCount;
     NSScreen *screen = view.window.screen;
-    [drawable addPresentedHandler:^(id<MTLDrawable> drawn) {
-        double time = drawn.presentedTime ?: screen.lastDisplayUpdateTimestamp ?: CACurrentMediaTime();
-        [self addPresentTime:time forFrame:frameCount];
-    }];
 
     std::unique_lock historyLock(_historyMutex);
 
@@ -317,6 +315,17 @@ static const char *PacingTypeToString(PacingType type) {
     }
 
     historyLock.unlock();
+
+    [drawable addPresentedHandler:^(id<MTLDrawable> drawn) {
+        double actualTime = drawn.presentedTime ?: CACurrentMediaTime();
+        double expectedTime = presentTime;
+        double time = expectedTime;
+        if (fabs(actualTime - expectedTime) > 0.1) {
+            self->_resyncs++;
+            time = actualTime;
+        }
+        [self addPresentTime:time forFrame:frameCount];
+    }];
 
     switch (_pacingType) {
         case PacingTypePresentAtTime:
