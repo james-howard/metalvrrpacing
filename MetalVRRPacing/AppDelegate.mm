@@ -30,6 +30,7 @@ static void SleepUntil(double hostTime) {
 
 enum PacingType : int {
     PacingTypePresentAtTime = 0,
+    PacingTypePresentAfterDuration,
     PacingTypeSleep,
     PacingTypeNone,
     PacingTypeMax
@@ -39,6 +40,8 @@ static const char *PacingTypeToString(PacingType type) {
     switch (type) {
         case PacingTypePresentAtTime:
             return "presentDrawable:atTime:";
+        case PacingTypePresentAfterDuration:
+            return "presentDrawable:afterMinimumDuration:";
         case PacingTypeSleep:
             return "Accurate Sleep";
         case PacingTypeNone:
@@ -263,7 +266,7 @@ static const char *PacingTypeToString(PacingType type) {
 
     ImGui::Checkbox("VSync", &_vsync);
 
-    int rateMin = 1.0 / self.screenMaxRefresh;
+    int rateMin = 15;
     int rateMax = 1.0 / self.screenMinRefresh;
     ImGui::SliderInt("Desired Refresh", &_requestedDisplayRate, rateMin, rateMax+1);
 
@@ -295,7 +298,7 @@ static const char *PacingTypeToString(PacingType type) {
     desc.colorAttachments[0].loadAction = MTLLoadActionClear;
 
     id<MTLRenderCommandEncoder> cmdEnc = [buf renderCommandEncoderWithDescriptor:desc];
-    
+
     [self runImGuiPerFrameWithDescriptor:desc
                                   buffer:buf
                                  encoder:cmdEnc];
@@ -318,6 +321,9 @@ static const char *PacingTypeToString(PacingType type) {
     switch (_pacingType) {
         case PacingTypePresentAtTime:
             [buf presentDrawable:drawable atTime:presentTime];
+            break;
+        case PacingTypePresentAfterDuration:
+            [buf presentDrawable:drawable afterMinimumDuration:frameTime];
             break;
         case PacingTypeSleep:
             SleepUntil(_lastPresentDrawable + frameTime);
