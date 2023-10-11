@@ -58,6 +58,7 @@ static const char *PacingTypeToString(PacingType type) {
     NSUInteger _lastPresentFrameCount;
     double _presentHistory;
     double _lastPresentDrawable; // time when presentDrawable: message sent
+    double _cpuToPresentLatency;
     NSUInteger _frameCount;
     PacingType _pacingType;
     BOOL _vsync;
@@ -171,7 +172,7 @@ static const char *PacingTypeToString(PacingType type) {
 
 #pragma mark - Present History Calculation
 
-- (void)addActualPresentTime:(double)actualTime expectedPresentTime:(double)expectedTime forFrame:(NSUInteger)frameNumber {
+- (void)addActualPresentTime:(double)actualTime expectedPresentTime:(double)expectedTime renderTime:(double)renderTime forFrame:(NSUInteger)frameNumber {
     std::lock_guard lock(_historyMutex);
 
     double dt = _lastPresentActual > 0.0 ? actualTime - _lastPresentActual : 0.0;
@@ -183,6 +184,9 @@ static const char *PacingTypeToString(PacingType type) {
     double alpha = 2.0 / (historySize + 1.0);
 
     _presentHistory = (alpha * dt) + ((1.0 - alpha) * _presentHistory);
+
+    double cpuDT = actualTime - renderTime;
+    _cpuToPresentLatency = (alpha * cpuDT) + ((1.0 - alpha) * _cpuToPresentLatency);
 }
 
 - (double)averagePresentInterval {
@@ -265,6 +269,7 @@ static const char *PacingTypeToString(PacingType type) {
     ImGui::Separator();
     ImGui::Text("Current Refresh: %.2fHz", 1.0 / [self averagePresentInterval]);
     ImGui::Text("Present Time Frame Lag: %d", static_cast<int>(_frameCount - _lastPresentFrameCount - 1));
+    ImGui::Text("CPU to Display Latency: %.2fms", _cpuToPresentLatency * 1000.0);
     ImGui::Text("Present Time Resyncs: %d", _resyncs);
 
     // --- ---
@@ -347,6 +352,7 @@ static const char *PacingTypeToString(PacingType type) {
 
     historyLock.unlock();
 
+    double renderTime = CACurrentMediaTime();
     [drawable addPresentedHandler:^(id<MTLDrawable> drawn) {
         double actualTime = drawn.presentedTime ?: CACurrentMediaTime();
         double expectedTime = presentTime;
@@ -355,7 +361,7 @@ static const char *PacingTypeToString(PacingType type) {
             self->_resyncs++;
             time = actualTime;
         }
-        [self addActualPresentTime:actualTime expectedPresentTime:time forFrame:frameCount];
+        [self addActualPresentTime:actualTime expectedPresentTime:time renderTime:renderTime forFrame:frameCount];
     }];
 
     PacingType pacingType = _pacingType;
