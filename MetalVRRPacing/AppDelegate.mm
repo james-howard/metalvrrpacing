@@ -61,12 +61,13 @@ static const char *PacingTypeToString(PacingType type) {
     double _cpuToPresentLatency;
     NSUInteger _frameCount;
     PacingType _pacingType;
-    BOOL _vsync;
-    BOOL _hdr;
-    BOOL _layerHDR;
-    BOOL _wcg;
-    BOOL _layerWCG;
+    bool _vsync;
+    bool _hdr;
+    bool _layerHDR;
+    bool _wcg;
+    bool _layerWCG;
     int _resyncs;
+    int _drawableCount;
     std::mutex _historyMutex;
 }
 
@@ -91,11 +92,14 @@ static const char *PacingTypeToString(PacingType type) {
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
     // just turn on the Metal HUD all the time to illustrate the problem.
-    setenv("MTL_HUD_ENABLED", "1", 1);
+    setenv("MTL_HUD_ENABLED", "1", 1); // macOS 15 and below
+    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"MetalForceHudEnabled"];
+
 
     // initialize GUI state
     self.requestedDisplayRate = 60;
     _vsync = YES;
+    _drawableCount = 2;
 
     // find the best display (fastest and has VRR)
     NSScreen *screen = [[[NSScreen screens] sortedArrayUsingComparator:^NSComparisonResult(NSScreen *a, NSScreen *b) {
@@ -153,15 +157,9 @@ static const char *PacingTypeToString(PacingType type) {
           self.window.screen.maximumRefreshInterval * 1000.0,
           self.window.screen.displayUpdateGranularity * 1000.0);
 
-//    CAMetalLayer *mtlLayer = (id)self.view.layer;
-//    mtlLayer.maximumDrawableCount = 2;
-//    mtlLayer.displaySyncEnabled = NO;
-
     self.cmdQ = [self.view.device newCommandQueue];
 
     [self setupImGui];
-
-//    [self renderLoop];
 }
 
 #pragma mark - RenderLoop
@@ -290,6 +288,7 @@ static const char *PacingTypeToString(PacingType type) {
     }
 
     ImGui::Checkbox("VSync", &_vsync);
+    ImGui::SliderInt("Swapchain Size", &_drawableCount, 2, 3);
 
     int rateMin = 15;
     int rateMax = 1.0 / self.screenMinRefresh;
@@ -303,6 +302,7 @@ static const char *PacingTypeToString(PacingType type) {
 - (void)drawInMTKView:(MTKView *)view {
     CAMetalLayer *mtlLayer = (CAMetalLayer *)view.layer;
     mtlLayer.displaySyncEnabled = _vsync;
+    mtlLayer.maximumDrawableCount = _drawableCount;
 
     if (_layerHDR != _hdr || _layerWCG != _wcg) {
         _layerHDR = _hdr;
