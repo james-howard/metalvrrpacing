@@ -88,14 +88,15 @@ static const char *PacingTypeToString(PacingType type) {
 
 @implementation AppDelegate
 
++ (void)initialize {
+    // just turn on the Metal HUD all the time to illustrate the problem.
+    setenv("MTL_HUD_ENABLED", "1", 1);
+    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"MetalForceHudEnabled"];
+}
+
 #pragma mark - NSApplicationDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
-    // just turn on the Metal HUD all the time to illustrate the problem.
-    setenv("MTL_HUD_ENABLED", "1", 1); // macOS 15 and below
-    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"MetalForceHudEnabled"];
-
-
     // initialize GUI state
     self.requestedDisplayRate = 60;
     _vsync = YES;
